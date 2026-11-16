@@ -1,0 +1,376 @@
+name: Apocalypse DLC RPG iOS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: macos-15
+    timeout-minutes: 25
+    env:
+      CI: 'true'
+      CAPACITOR_TELEMETRY_DISABLED: '1'
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install build tools
+        run: |
+          xcodebuild -version
+          command -v ffmpeg >/dev/null || brew install ffmpeg
+          command -v 7zz >/dev/null || brew install sevenzip
+          cat > package.json <<'EOF'
+          {
+            "name": "apocalypse-ios-build",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "@capacitor/cli": "8.6.2",
+              "@capacitor/core": "8.6.2",
+              "@capacitor/ios": "8.6.2"
+            }
+          }
+          EOF
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "io.fanport.apocalypserpg",
+            "appName": "Apocalypse DLC RPG",
+            "webDir": "www",
+            "ios": {
+              "contentInset": "never"
+            }
+          }
+          EOF
+          npm install --no-audit --no-fund
+
+      - name: Download and extract the original game
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import shutil
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+
+          upload = (
+              "https://eddy-andrson.itch.io/"
+              "slendytubbies-3-rpg-apocalipsis-dlc-fanmade-2020/file/2593190"
+          )
+          checksum = "beeb08bc172a5f8dcc896fcaff3bdfba755c789c9082bff26ef86480958221cc"
+          archive = Path(os.environ["RUNNER_TEMP"]) / "original.rar"
+          with urlopen(Request(upload, data=b""), timeout=30) as response:
+              download_url = json.load(response)["url"]
+          with urlopen(download_url, timeout=60) as source, archive.open("wb") as output:
+              shutil.copyfileobj(source, output, length=1024 * 1024)
+          with archive.open("rb") as source:
+              actual = hashlib.file_digest(source, "sha256").hexdigest()
+          if actual != checksum:
+              raise ValueError("The archive differs from the tested itch.io release.")
+          PY
+          7zz x -y -o"$RUNNER_TEMP/apocalypse" "$RUNNER_TEMP/original.rar" \
+            > "$RUNNER_TEMP/extraction.log"
+          game="$RUNNER_TEMP/apocalypse/SL3 RPG FANMADE DLC 2020/www"
+          test -f "$game/index.html"
+          cp -R "$game" www
+
+      - name: Prepare the game for iOS
+        run: |
+          cat > www/touch.css <<'EOF'
+          html, body {
+            margin: 0;
+            background: #000;
+            overscroll-behavior: none;
+            -webkit-user-select: none;
+            user-select: none;
+          }
+          #mobile-controls {
+            position: fixed;
+            z-index: 20;
+            inset: 0;
+            pointer-events: none;
+            --button-size: clamp(34px, 7.5vw, 53px);
+          }
+          #mobile-controls[hidden] { display: none; }
+          #mobile-controls button {
+            appearance: none;
+            width: var(--button-size);
+            height: var(--button-size);
+            margin: 0;
+            padding: 0;
+            border: 1px solid #d4d4d480;
+            border-radius: 12px;
+            background: #101319b8;
+            color: #fff;
+            font: 600 18px system-ui, sans-serif;
+            pointer-events: auto;
+            touch-action: none;
+            -webkit-tap-highlight-color: transparent;
+          }
+          #mobile-controls button.pressed { background: #53637de6; }
+          #mobile-controls .directions,
+          #mobile-controls .actions {
+            position: absolute;
+            bottom: max(8px, env(safe-area-inset-bottom));
+            display: grid;
+            grid-auto-rows: var(--button-size);
+            gap: 3px;
+          }
+          #mobile-controls .directions {
+            left: max(8px, env(safe-area-inset-left));
+            grid-template-columns: repeat(3, var(--button-size));
+          }
+          #mobile-controls .actions {
+            right: max(8px, env(safe-area-inset-right));
+            grid-template-columns: repeat(2, var(--button-size));
+          }
+          #mobile-controls [data-key="38"] { grid-area: 1 / 2; }
+          #mobile-controls [data-key="37"] { grid-area: 2 / 1; }
+          #mobile-controls [data-key="40"] { grid-area: 2 / 2; }
+          #mobile-controls [data-key="39"] { grid-area: 2 / 3; }
+          #mobile-controls [data-key="16"] { grid-column: 2; font-size: 14px; }
+          #mobile-controls [data-key="13"] { font-size: 15px; }
+          EOF
+
+          cat > www/js/touch.js <<'EOF'
+          (() => {
+            if (!matchMedia('(pointer: coarse)').matches && !navigator.maxTouchPoints) return;
+
+            const controls = document.getElementById('mobile-controls');
+            const pointers = new Map();
+            const pendingReleases = new Set();
+            const runButton = controls.querySelector('[data-key="16"]');
+            let naming = false;
+
+            function dispatchKey(type, key) {
+              const event = new KeyboardEvent(type, { bubbles: true, cancelable: true });
+              Object.defineProperty(event, 'keyCode', { value: key });
+              document.dispatchEvent(event);
+            }
+
+            const updateInput = Input.update;
+            Input.update = function () {
+              updateInput.apply(this, arguments);
+              for (const key of pendingReleases) dispatchKey('keyup', key);
+              pendingReleases.clear();
+              const inNameEntry = SceneManager._scene instanceof Scene_Name;
+              if (naming !== inNameEntry) {
+                naming = inNameEntry;
+                runButton.textContent = naming ? 'Fin' : 'Cor.';
+                runButton.setAttribute('aria-label', naming ? 'Ir a confirmar nombre' : 'Correr');
+              }
+            };
+
+            function release(pointerId) {
+              const button = pointers.get(pointerId);
+              if (!button) return;
+              pointers.delete(pointerId);
+              if ([...pointers.values()].includes(button)) return;
+              button.classList.remove('pressed');
+              pendingReleases.add(Number(button.dataset.key));
+            }
+
+            for (const button of controls.querySelectorAll('button')) {
+              button.addEventListener('pointerdown', (event) => {
+                if (event.button !== 0) return;
+                event.preventDefault();
+                const alreadyPressed = [...pointers.values()].includes(button);
+                pointers.set(event.pointerId, button);
+                button.setPointerCapture(event.pointerId);
+                button.classList.add('pressed');
+                const key = Number(button.dataset.key);
+                pendingReleases.delete(key);
+                if (!alreadyPressed) dispatchKey('keydown', key);
+              });
+
+              for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+                button.addEventListener(type, (event) => release(event.pointerId));
+              }
+            }
+
+            for (const type of ['touchstart', 'touchmove', 'touchend', 'touchcancel', 'contextmenu']) {
+              controls.addEventListener(type, (event) => event.stopPropagation());
+            }
+
+            function releaseAll() {
+              for (const pointerId of pointers.keys()) release(pointerId);
+            }
+            window.addEventListener('blur', releaseAll);
+            document.addEventListener('visibilitychange', () => {
+              if (document.hidden) releaseAll();
+            });
+
+            controls.addEventListener('touchstart', () => {
+              if (window.WebAudio?._context?.state === 'suspended') {
+                window.WebAudio._context.resume().catch(() => {});
+              }
+              if (window.Graphics?._video?.getAttribute('src')) Graphics._onTouchEnd();
+            }, { passive: true });
+
+            controls.hidden = false;
+          })();
+          EOF
+
+          python3 - <<'PY'
+          from concurrent.futures import ThreadPoolExecutor
+          from pathlib import Path
+          import re
+          import subprocess
+
+          web = Path("www")
+
+          def replace_once(path, old, new):
+              text = path.read_text(encoding="utf-8-sig")
+              if text.count(old) != 1:
+                  raise ValueError(f"Expected one matching source line in {path}")
+              path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          controls = """
+          <div id="mobile-controls" hidden>
+            <div class="directions" role="group" aria-label="Movimiento">
+              <button type="button" data-key="38" aria-label="Arriba">↑</button>
+              <button type="button" data-key="37" aria-label="Izquierda">←</button>
+              <button type="button" data-key="40" aria-label="Abajo">↓</button>
+              <button type="button" data-key="39" aria-label="Derecha">→</button>
+            </div>
+            <div class="actions" role="group" aria-label="Acciones">
+              <button type="button" data-key="16" aria-label="Correr">Cor.</button>
+              <button type="button" data-key="27" aria-label="Atrás o menú">↩</button>
+              <button type="button" data-key="13" aria-label="Confirmar">OK</button>
+            </div>
+          </div>
+          <script src="js/touch.js"></script>
+          """
+          index = web / "index.html"
+          replace_once(index, 'content="user-scalable=no"',
+                       'content="width=device-width, initial-scale=1, viewport-fit=cover"')
+          replace_once(index, "</head>", '<link rel="stylesheet" href="touch.css">\n    </head>')
+          replace_once(index, "</body>", controls + "    </body>")
+
+          js = web / "js"
+          replace_once(js / "plugins/SRD_GameUpgrade.js",
+                       "_.isNewNWjs = process.versions['node-webkit']",
+                       "_.isNewNWjs = Utils.isNwjs() && process.versions['node-webkit']")
+          replace_once(js / "plugins.js",
+                       '"name":"OrangeTimeSystemLighting","status":true',
+                       '"name":"OrangeTimeSystemLighting","status":false')
+
+          for name, signature, body in (
+              ("rpg_managers.js", "AudioManager.audioFileExt", "return '.m4a';"),
+              ("rpg_objects.js", "Game_Interpreter.prototype.videoFileExt",
+               "return Graphics.canPlayVideoType('video/mp4') ? '.mp4' : '.webm';"),
+          ):
+              path = js / name
+              expression = re.escape(signature) + r" = function\(\) \{.*?\n\};"
+              result, count = re.subn(expression, signature + " = function() { " + body + " };",
+                                      path.read_text(), flags=re.DOTALL)
+              if count != 1:
+                  raise ValueError(f"Unexpected media loader in {path}")
+              path.write_text(result, encoding="utf-8")
+
+          core = js / "rpg_core.js"
+          replace_once(core, "Graphics._onTouchEnd = function(event) {",
+                       "Graphics._onTouchEnd = function(event) {\n"
+                       "    if (!this._video || !this._video.getAttribute('src')) return;")
+          replace_once(core, "    makeVideoPlayableInline(this._video);",
+                       "    this._video.playsInline = true;")
+          replace_once(core, "    this._video.play();\n    this._updateVisibility(true);",
+                       "    var playback = this._video.play();\n"
+                       "    if (playback) playback.catch(function() {});\n"
+                       "    this._updateVisibility(true);")
+          replace_once(core, "        this._video.play();\n        this._videoUnlocked = true;",
+                       "        this._video.play().catch(function() {});\n"
+                       "        this._videoUnlocked = true;")
+          replace_once(core,
+                       "    if (this._isVideoVisible() && this._video.paused) {\n"
+                       "        this._video.play();",
+                       "    if (this._isVideoVisible() && this._video.paused) {\n"
+                       "        this._video.play().catch(function() {});")
+
+          def convert(path):
+              if path.suffix == ".ogg":
+                  codec = ["-c:a", "aac", "-b:a", "128k"]
+                  output = path.with_suffix(".m4a")
+              else:
+                  codec = ["-c:v", "libx264", "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                           "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k"]
+                  output = path.with_suffix(".mp4")
+              subprocess.run(
+                  ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                   "-i", str(path), "-map_metadata", "0", *codec, "-movflags", "+faststart",
+                   "-threads", "1", str(output)],
+                  check=True,
+              )
+              if not output.stat().st_size:
+                  raise OSError(f"Empty media output: {output}")
+              if path.suffix == ".ogg":
+                  path.unlink()
+
+          files = sorted((web / "audio").rglob("*.ogg"))
+          files += sorted((web / "movies").glob("*.webm"))
+          with ThreadPoolExecutor(max_workers=4) as pool:
+              list(pool.map(convert, files))
+          print(f"Prepared {len(files)} media files")
+          PY
+
+      - name: Set up the Xcode project
+        run: |
+          npx --no-install cap add ios --packagemanager SPM
+          python3 - <<'PY'
+          from pathlib import Path
+          import plistlib
+
+          info = Path("ios/App/App/Info.plist")
+          settings = plistlib.loads(info.read_bytes())
+          landscape = ["UIInterfaceOrientationLandscapeLeft", "UIInterfaceOrientationLandscapeRight"]
+          settings["UISupportedInterfaceOrientations"] = landscape
+          settings["UISupportedInterfaceOrientations~ipad"] = landscape
+          settings["UIRequiresFullScreen"] = True
+          settings["UIStatusBarHidden"] = True
+          settings["UIViewControllerBasedStatusBarAppearance"] = False
+          info.write_bytes(plistlib.dumps(settings, sort_keys=False))
+          PY
+          ffmpeg -hide_banner -loglevel error -y -i www/icon/icon.png \
+            -vf 'scale=1024:1024:flags=lanczos,format=rgb24' -frames:v 1 \
+            ios/App/App/Assets.xcassets/AppIcon.appiconset/AppIcon-512@2x.png
+
+      - name: Build the unsigned iPhone app
+        run: |
+          set -o pipefail
+          xcodebuild build -project ios/App/App.xcodeproj -scheme App \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/apocalypse-build" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Package and check the IPA
+        run: |
+          mkdir -p Payload
+          cp -R "$RUNNER_TEMP/apocalypse-build/Build/Products/Release-iphoneos/App.app" Payload/
+          test -f Payload/App.app/public/data/Map002.json
+          test -f Payload/App.app/public/js/touch.js
+          file Payload/App.app/App | grep arm64
+          ditto -c -k --keepParent Payload Apocalypse-DLC-RPG-iOS-unsigned.ipa
+          unzip -tq Apocalypse-DLC-RPG-iOS-unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Apocalypse-DLC-RPG-iOS
+          path: Apocalypse-DLC-RPG-iOS-unsigned.ipa
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: Apocalypse-iOS-build-log
+          path: |
+            ${{ runner.temp }}/xcodebuild.log
+            ${{ runner.temp }}/extraction.log
