@@ -26,7 +26,7 @@ jobs:
         run: |
           xcodebuild -version
           command -v ffmpeg >/dev/null || brew install ffmpeg
-          command -v 7zz >/dev/null || brew install sevenzip
+          brew list --versions libarchive >/dev/null || brew install libarchive
           cat > package.json <<'EOF'
           {
             "name": "apocalypse-ios-build",
@@ -76,8 +76,9 @@ jobs:
           if actual != checksum:
               raise ValueError("The archive differs from the tested itch.io release.")
           PY
-          7zz x -y -o"$RUNNER_TEMP/apocalypse" "$RUNNER_TEMP/original.rar" \
-            > "$RUNNER_TEMP/extraction.log"
+          mkdir -p "$RUNNER_TEMP/apocalypse"
+          "$(brew --prefix libarchive)/bin/bsdtar" -xvf "$RUNNER_TEMP/original.rar" \
+            -C "$RUNNER_TEMP/apocalypse" > "$RUNNER_TEMP/extraction.log" 2>&1
           game="$RUNNER_TEMP/apocalypse/SL3 RPG FANMADE DLC 2020/www"
           test -f "$game/index.html"
           cp -R "$game" www
